@@ -33,6 +33,10 @@ impl DeezerApi {
         })
     }
 
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
     /// Login using ARL cookie
     pub async fn login_via_arl(&self, arl: &str) -> Result<bool> {
         // Set the ARL cookie by making a request with it
@@ -434,17 +438,55 @@ impl DeezerApi {
         self.gw_call("artist.getData", json!({ "ART_ID": art_id })).await
     }
 
+    pub async fn get_favorite_artist_ids(&self) -> Result<Vec<String>> {
+        let user_id = {
+            let user = self.current_user.lock().await;
+            user.as_ref().context("Not logged in")?.id
+        };
+
+        let result = self
+            .gw_call(
+                "deezer.pageProfile",
+                json!({
+                    "USER_ID": user_id,
+                    "tab": "artists",
+                    "nb": 10000,
+                }),
+            )
+            .await?;
+
+        let data = result["TAB"]["artists"]["data"]
+            .as_array()
+            .context("No artists data in profile response")?;
+
+        let ids = data
+            .iter()
+            .filter_map(|item| {
+                let art_id = &item["ART_ID"];
+                match art_id {
+                    Value::Number(n) => Some(n.to_string()),
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        Ok(ids)
+    }
+
     // ========== Track URL ==========
 
     pub async fn get_track_url(&self, track_token: &str, format: &str) -> Result<Option<String>> {
-        let user = self.current_user.lock().await;
-        let user = user.as_ref().context("Not logged in")?;
+        let license_token = {
+            let user = self.current_user.lock().await;
+            user.as_ref().context("Not logged in")?.license_token.clone()
+        };
 
         let response = self
             .client
             .post(MEDIA_URL)
             .json(&json!({
-                "license_token": user.license_token,
+                "license_token": license_token,
                 "media": [{
                     "type": "FULL",
                     "formats": [{ "cipher": "BF_CBC_STRIPE", "format": format }]

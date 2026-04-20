@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
-use futures_util::StreamExt;
-use indicatif::{ProgressBar, ProgressStyle};
+use futures_util::{stream, StreamExt};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -8,6 +8,11 @@ use tokio::io::AsyncWriteExt;
 use crate::api::DeezerApi;
 use crate::crypto;
 use crate::models::*;
+
+pub enum TrackOutcome {
+    Downloaded(PathBuf),
+    Skipped(PathBuf),
+}
 
 /// Sanitize a filename by removing/replacing invalid characters
 fn sanitize_filename(name: &str) -> String {
@@ -78,8 +83,7 @@ pub async fn download_track(
     track: &GwTrack,
     format: TrackFormat,
     output_dir: &Path,
-    show_progress: bool,
-) -> Result<PathBuf> {
+) -> Result<TrackOutcome> {
     let artist = sanitize_filename(&track.artist());
     let title = sanitize_filename(&track.title());
     let sng_id = track.id_str();
@@ -101,18 +105,11 @@ pub async fn download_track(
 
     // Skip if already exists
     if filepath.exists() {
-        if show_progress {
-            println!("  [skip] {} (already exists)", filename);
-        }
-        return Ok(filepath);
+        return Ok(TrackOutcome::Skipped(filepath));
     }
 
     // Download
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()?;
-
-    let response = client
+    let response = api.client()
         .get(&url)
         .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.130 Safari/537.36")
         .send()
@@ -125,33 +122,13 @@ pub async fn download_track(
 
     let total_size = response.content_length().unwrap_or(0);
 
-    let pb = if show_progress && total_size > 0 {
-        let pb = ProgressBar::new(total_size);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("  [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
-                .unwrap()
-                .progress_chars("##-"),
-        );
-        Some(pb)
-    } else {
-        None
-    };
-
     // Download to memory (needed for decryption)
     let mut data = Vec::with_capacity(total_size as usize);
     let mut stream = response.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("Error reading download stream")?;
-        if let Some(ref pb) = pb {
-            pb.inc(chunk.len() as u64);
-        }
         data.extend_from_slice(&chunk);
-    }
-
-    if let Some(pb) = pb {
-        pb.finish_and_clear();
     }
 
     if data.is_empty() {
@@ -183,7 +160,7 @@ pub async fn download_track(
     file.write_all(&output_data).await?;
     file.flush().await?;
 
-    Ok(filepath)
+    Ok(TrackOutcome::Downloaded(filepath))
 }
 
 /// Download a playlist by ID
@@ -192,6 +169,7 @@ pub async fn download_playlist(
     playlist_id: &str,
     format: TrackFormat,
     output_dir: &Path,
+    concurrency: usize,
 ) -> Result<()> {
     // Get playlist info
     let info = api.get_playlist_info(playlist_id).await?;
@@ -209,27 +187,50 @@ pub async fn download_playlist(
     println!("Found {} tracks\n", total);
 
     let mut downloaded = 0;
+    let mut skipped = 0;
     let mut failed = 0;
 
-    for (i, track) in tracks.iter().enumerate() {
-        let display = track.display_name();
-        println!("[{}/{}] {}", i + 1, total, display);
+    let pb = ProgressBar::new(total as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("  {bar:50.cyan/blue} {pos}/{len} tracks")
+            .unwrap()
+            .progress_chars("##-"),
+    );
 
-        match download_track(api, track, format, &playlist_dir, true).await {
-            Ok(_) => {
+    let mut dl_stream = stream::iter(tracks)
+        .map(|track| {
+            let dir = playlist_dir.clone();
+            async move {
+                let display = track.display_name();
+                let result = download_track(api, &track, format, &dir).await;
+                (display, result)
+            }
+        })
+        .buffer_unordered(concurrency);
+
+    while let Some((display, result)) = dl_stream.next().await {
+        match result {
+            Ok(TrackOutcome::Downloaded(_)) => {
                 downloaded += 1;
-                println!("  [ok] Downloaded successfully");
+                pb.println(format!("  [ok]   {}", display));
+            }
+            Ok(TrackOutcome::Skipped(_)) => {
+                skipped += 1;
+                pb.println(format!("  [skip] {}", display));
             }
             Err(e) => {
                 failed += 1;
-                eprintln!("  [err] Failed: {}", e);
+                pb.println(format!("  [err]  {} — {}", display, e));
             }
         }
+        pb.inc(1);
     }
+    pb.finish_and_clear();
 
     println!(
-        "\nPlaylist complete: {} downloaded, {} failed out of {} tracks",
-        downloaded, failed, total
+        "\nPlaylist complete: {} downloaded, {} skipped, {} failed out of {} tracks",
+        downloaded, skipped, failed, total
     );
     Ok(())
 }
@@ -239,6 +240,7 @@ pub async fn download_favorites(
     api: &DeezerApi,
     format: TrackFormat,
     output_dir: &Path,
+    concurrency: usize,
 ) -> Result<()> {
     println!("Fetching favorite tracks...\n");
 
@@ -250,38 +252,60 @@ pub async fn download_favorites(
 
     println!("Found {} favorite tracks\n", ids.len());
 
-    // Fetch track data in batches
-    let favorites_dir = output_dir.join("Favorites");
-    let total = ids.len();
-    let mut downloaded = 0;
-    let mut failed = 0;
-
-    // Process in batches of 50
-    for (batch_start, batch) in ids.chunks(50).enumerate() {
-        let batch_ids: Vec<String> = batch.to_vec();
-        let tracks = api.get_tracks_by_ids(&batch_ids).await?;
-
-        for (j, track) in tracks.iter().enumerate() {
-            let i = batch_start * 50 + j + 1;
-            let display = track.display_name();
-            println!("[{}/{}] {}", i, total, display);
-
-            match download_track(api, track, format, &favorites_dir, true).await {
-                Ok(_) => {
-                    downloaded += 1;
-                    println!("  [ok] Downloaded successfully");
-                }
-                Err(e) => {
-                    failed += 1;
-                    eprintln!("  [err] Failed: {}", e);
-                }
-            }
-        }
+    // Fetch all track metadata in batches of 50
+    let mut all_tracks: Vec<GwTrack> = Vec::with_capacity(ids.len());
+    for batch in ids.chunks(50) {
+        let tracks = api.get_tracks_by_ids(batch).await?;
+        all_tracks.extend(tracks);
     }
 
+    let favorites_dir = output_dir.join("Favorites");
+    let total = all_tracks.len();
+    let mut downloaded = 0;
+    let mut skipped = 0;
+    let mut failed = 0;
+
+    let pb = ProgressBar::new(total as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("  {bar:50.cyan/blue} {pos}/{len} tracks")
+            .unwrap()
+            .progress_chars("##-"),
+    );
+
+    let mut dl_stream = stream::iter(all_tracks)
+        .map(|track| {
+            let dir = favorites_dir.clone();
+            async move {
+                let display = track.display_name();
+                let result = download_track(api, &track, format, &dir).await;
+                (display, result)
+            }
+        })
+        .buffer_unordered(concurrency);
+
+    while let Some((display, result)) = dl_stream.next().await {
+        match result {
+            Ok(TrackOutcome::Downloaded(_)) => {
+                downloaded += 1;
+                pb.println(format!("  [ok]   {}", display));
+            }
+            Ok(TrackOutcome::Skipped(_)) => {
+                skipped += 1;
+                pb.println(format!("  [skip] {}", display));
+            }
+            Err(e) => {
+                failed += 1;
+                pb.println(format!("  [err]  {} — {}", display, e));
+            }
+        }
+        pb.inc(1);
+    }
+    pb.finish_and_clear();
+
     println!(
-        "\nFavorites complete: {} downloaded, {} failed out of {} tracks",
-        downloaded, failed, total
+        "\nFavorites complete: {} downloaded, {} skipped, {} failed out of {} tracks",
+        downloaded, skipped, failed, total
     );
     Ok(())
 }
@@ -292,63 +316,173 @@ pub async fn download_artist(
     art_id: &str,
     format: TrackFormat,
     output_dir: &Path,
+    concurrency: usize,
+    include_all: bool,
+) -> Result<()> {
+    let mp = MultiProgress::new();
+    download_artist_inner(api, art_id, format, output_dir, concurrency, include_all, &mp, None).await
+}
+
+async fn download_artist_inner(
+    api: &DeezerApi,
+    art_id: &str,
+    format: TrackFormat,
+    output_dir: &Path,
+    concurrency: usize,
+    include_all: bool,
+    mp: &MultiProgress,
+    anchor: Option<&ProgressBar>,
 ) -> Result<()> {
     let artist_info = api.get_artist_info(art_id).await?;
     let artist_name = artist_info["ART_NAME"]
         .as_str()
         .unwrap_or("Unknown Artist");
 
-    println!("Fetching discography for: {}\n", artist_name);
+    let log = |msg: &str| {
+        if let Some(pb) = anchor {
+            pb.println(msg);
+        } else {
+            println!("{}", msg);
+        }
+    };
+
+    log(&format!("Fetching discography for: {}\n", artist_name));
 
     let albums = api.get_artist_discography(art_id).await?;
+    let albums: Vec<_> = albums.into_iter()
+        .filter(|alb| include_all || alb.art_name.as_deref() == Some(artist_name))
+        .collect();
     if albums.is_empty() {
-        println!("No albums found for this artist.");
+        log(&format!("No albums found for {}.", artist_name));
         return Ok(());
     }
 
-    println!("Found {} albums/releases\n", albums.len());
+    log(&format!("Found {} albums/releases\n", albums.len()));
 
     let artist_dir = output_dir.join(sanitize_filename(artist_name));
     let mut total_downloaded = 0;
     let mut total_failed = 0;
+    let total_albums = albums.len();
+
+    let album_pb = match anchor {
+        Some(a) => mp.insert_before(a, ProgressBar::new(total_albums as u64)),
+        None => mp.add(ProgressBar::new(total_albums as u64)),
+    };
+    album_pb.set_style(
+        ProgressStyle::default_bar()
+            .template("  {bar:50.green/white} {pos}/{len} albums")
+            .unwrap()
+            .progress_chars("##-"),
+    );
 
     for album in &albums {
         let alb_id = album.id_str();
         let album_title = album.alb_title.as_deref().unwrap_or("Unknown Album");
         let album_dir = artist_dir.join(sanitize_filename(album_title));
 
-        println!("--- Album: {} ---", album_title);
+        album_pb.println(format!("--- Album: {} ---", album_title));
 
         let tracks = match api.get_album_tracks(&alb_id).await {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("  [err] Failed to get album tracks: {}", e);
+                album_pb.println(format!("  [err] Failed to get album tracks: {}", e));
                 total_failed += 1;
+                album_pb.inc(1);
                 continue;
             }
         };
 
-        for (i, track) in tracks.iter().enumerate() {
-            let display = track.display_name();
-            println!("  [{}/{}] {}", i + 1, tracks.len(), display);
+        let album_total = tracks.len();
+        let track_pb = mp.insert_before(&album_pb, ProgressBar::new(album_total as u64));
+        track_pb.set_style(
+            ProgressStyle::default_bar()
+                .template("    {bar:50.cyan/blue} {pos}/{len} tracks")
+                .unwrap()
+                .progress_chars("##-"),
+        );
 
-            match download_track(api, track, format, &album_dir, true).await {
-                Ok(_) => {
+        let mut track_stream = stream::iter(tracks)
+            .map(|track| {
+                let dir = album_dir.clone();
+                async move {
+                    let display = track.display_name();
+                    let result = download_track(api, &track, format, &dir).await;
+                    (display, result)
+                }
+            })
+            .buffer_unordered(concurrency);
+
+        while let Some((display, result)) = track_stream.next().await {
+            match result {
+                Ok(TrackOutcome::Downloaded(_)) => {
                     total_downloaded += 1;
-                    println!("    [ok] Downloaded");
+                    track_pb.println(format!("    [ok]   {}", display));
+                }
+                Ok(TrackOutcome::Skipped(_)) => {
+                    track_pb.println(format!("    [skip] {}", display));
                 }
                 Err(e) => {
                     total_failed += 1;
-                    eprintln!("    [err] Failed: {}", e);
+                    track_pb.println(format!("    [err]  {} — {}", display, e));
                 }
             }
+            track_pb.inc(1);
         }
+        track_pb.finish_and_clear();
+        album_pb.inc(1);
+    }
+    album_pb.finish_and_clear();
+
+    if let Some(pb) = anchor {
+        pb.println(format!(
+            "\n{}: {} downloaded, {} failed",
+            artist_name, total_downloaded, total_failed
+        ));
+    } else {
+        println!(
+            "\nArtist download complete: {} downloaded, {} failed",
+            total_downloaded, total_failed
+        );
+    }
+    Ok(())
+}
+
+/// Download all favorited/followed artists' discographies
+pub async fn download_favorite_artists(
+    api: &DeezerApi,
+    format: TrackFormat,
+    output_dir: &Path,
+    concurrency: usize,
+    include_all: bool,
+) -> Result<()> {
+    println!("Fetching followed artists...\n");
+
+    let ids = api.get_favorite_artist_ids().await?;
+    if ids.is_empty() {
+        println!("No followed artists found.");
+        return Ok(());
     }
 
-    println!(
-        "\nArtist download complete: {} downloaded, {} failed",
-        total_downloaded, total_failed
+    println!("Found {} followed artists\n", ids.len());
+
+    let mp = MultiProgress::new();
+    let artist_pb = mp.add(ProgressBar::new(ids.len() as u64));
+    artist_pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{bar:50.yellow/white} {pos}/{len} artists")
+            .unwrap()
+            .progress_chars("##-"),
     );
+
+    for art_id in &ids {
+        match download_artist_inner(api, art_id, format, output_dir, concurrency, include_all, &mp, Some(&artist_pb)).await {
+            Ok(()) => {}
+            Err(e) => artist_pb.println(format!("  [err] {}: {}", art_id, e)),
+        }
+        artist_pb.inc(1);
+    }
+    artist_pb.finish_and_clear();
+
     Ok(())
 }
 
@@ -365,9 +499,12 @@ pub async fn download_single_track(
     let display = track.display_name();
     println!("Downloading: {}\n", display);
 
-    match download_track(api, &track, format, output_dir, true).await {
-        Ok(path) => {
+    match download_track(api, &track, format, output_dir).await {
+        Ok(TrackOutcome::Downloaded(path)) => {
             println!("\nSaved to: {}", path.display());
+        }
+        Ok(TrackOutcome::Skipped(path)) => {
+            println!("\nAlready exists: {}", path.display());
         }
         Err(e) => {
             eprintln!("\nFailed to download: {}", e);

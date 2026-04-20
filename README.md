@@ -7,12 +7,14 @@ A fast, lightweight Deezer music downloader written in Rust. Single binary, no r
 - **Track download** — by URL or Deezer ID
 - **Playlist download** — by URL, ID, or interactive selection from your account
 - **Favorites download** — all your liked/loved tracks
+- **Favorite artists** — download full discographies for all your followed bands
 - **Artist discography** — download every album from an artist, with name search
 - **Interactive mode** — menu-driven TUI when no command is specified
 - **Quality selection** — FLAC, MP3 320kbps, MP3 128kbps with automatic fallback
+- **Parallel downloads** — configurable concurrency via `--threads`
 - **Blowfish CBC decryption** — handles Deezer's encrypted streams natively
 - **Skip existing** — won't re-download files already on disk
-- **Progress bars** — per-track download progress
+- **Progress bars** — stacked track / album / artist bars with `indicatif`
 - **Persistent login** — ARL cookie stored in `~/.config/deezer-dl/.arl`
 
 ## Installation
@@ -20,7 +22,7 @@ A fast, lightweight Deezer music downloader written in Rust. Single binary, no r
 ### From source
 
 ```bash
-git clone https://github.com/youruser/deezer-dl.git
+git clone https://github.com/jojo8356/deezer-dl.git
 cd deezer-dl
 cargo build --release
 ```
@@ -45,6 +47,7 @@ deezer-dl [OPTIONS] [COMMAND]
 | `track` | Download a track by URL or ID |
 | `playlist` | Download a playlist by URL or ID |
 | `favorites` | Download your liked/favorite songs |
+| `favorites -a` | Download full discographies for all followed artists |
 | `artist` | Download all songs from an artist |
 | `interactive`| Interactive mode (default when no command) |
 | `logout` | Remove stored login credentials |
@@ -55,6 +58,8 @@ deezer-dl [OPTIONS] [COMMAND]
 |------|-------------|---------|
 | `-o, --output <DIR>` | Output directory | `~/Telechargements/mp3` (interactive) / `./downloads` (CLI) |
 | `-q, --quality <QUALITY>` | Audio quality: `flac`, `320`, `128` | `320` |
+| `-t, --threads <N>` | Max concurrent downloads | `4` |
+| `-i, --include-all` | Include "Featured On" and unofficial releases for artist downloads | off |
 | `-h, --help` | Print help | |
 | `-V, --version` | Print version | |
 
@@ -74,9 +79,18 @@ deezer-dl playlist https://www.deezer.com/en/playlist/908622995
 # Download all your liked songs in FLAC
 deezer-dl -q flac favorites
 
+# Download full discographies for all followed artists
+deezer-dl favorites -a
+
+# Same, but include Featured On / compilation appearances
+deezer-dl -i favorites -a
+
 # Download an artist's full discography
 deezer-dl artist "Daft Punk"
 deezer-dl artist 27
+
+# Artist discography including Featured On releases, 8 parallel downloads
+deezer-dl -t 8 -i artist "Blind Guardian"
 
 # Custom output directory
 deezer-dl -o ~/Music -q flac artist "Radiohead"
