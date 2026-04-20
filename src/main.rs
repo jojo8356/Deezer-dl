@@ -25,6 +25,14 @@ struct Cli {
     /// Audio quality: flac, 320, 128
     #[arg(short, long, default_value = "320")]
     quality: String,
+
+    /// Max concurrent downloads
+    #[arg(short, long, default_value_t = 4)]
+    threads: usize,
+
+    /// Include all releases from artists, including "Featured On" section
+    #[arg(short, long, default_value_t = false)]
+    include_all: bool,
 }
 
 #[derive(Subcommand)]
@@ -40,7 +48,11 @@ enum Commands {
         url: String,
     },
     /// Download your liked/favorite songs
-    Favorites,
+    Favorites {
+        /// Download all followed artists' full discographies instead of liked tracks
+        #[arg(short = 'a', long)]
+        all_artists: bool,
+    },
     /// Download all songs from an artist
     Artist {
         /// Deezer artist URL, ID, or search name
@@ -83,7 +95,7 @@ fn default_output_dir() -> PathBuf {
         .join("mp3")
 }
 
-async fn interactive_mode(api: &DeezerApi, format: TrackFormat, output: &PathBuf) -> Result<()> {
+async fn interactive_mode(api: &DeezerApi, format: TrackFormat, output: &PathBuf, concurrency: usize) -> Result<()> {
     println!("Output directory: {}\n", output.display());
 
     loop {
@@ -92,6 +104,7 @@ async fn interactive_mode(api: &DeezerApi, format: TrackFormat, output: &PathBuf
             "Download a track (URL or search)",
             "Download a playlist",
             "Download favorites (liked songs)",
+            "Download all songs from favorite bands",
             "Download all songs from an artist",
             "Quit",
         ];
@@ -128,7 +141,7 @@ async fn interactive_mode(api: &DeezerApi, format: TrackFormat, output: &PathBuf
                             .with_prompt("Enter playlist URL or ID")
                             .interact_text()?;
                         let id = extract_id(&input, "playlist");
-                        download::download_playlist(api, &id, format, output).await?;
+                        download::download_playlist(api, &id, format, output, concurrency).await?;
                     }
                     1 => {
                         let user = api.current_user.lock().await;
@@ -153,15 +166,18 @@ async fn interactive_mode(api: &DeezerApi, format: TrackFormat, output: &PathBuf
                             .interact()?;
 
                         let playlist_id = playlists[sel].id_str();
-                        download::download_playlist(api, &playlist_id, format, output).await?;
+                        download::download_playlist(api, &playlist_id, format, output, concurrency).await?;
                     }
                     _ => {}
                 }
             }
             2 => {
-                download::download_favorites(api, format, output).await?;
+                download::download_favorites(api, format, output, concurrency).await?;
             }
             3 => {
+                download::download_favorite_artists(api, format, output, concurrency, false).await?;
+            }
+            4 => {
                 let input: String = Input::new()
                     .with_prompt("Enter artist URL, ID, or name to search")
                     .interact_text()?;
@@ -169,7 +185,7 @@ async fn interactive_mode(api: &DeezerApi, format: TrackFormat, output: &PathBuf
                 // Check if it's a URL or ID
                 if input.contains("deezer.com") || input.chars().all(|c| c.is_ascii_digit()) {
                     let id = extract_id(&input, "artist");
-                    download::download_artist(api, &id, format, output).await?;
+                    download::download_artist(api, &id, format, output, concurrency, false).await?;
                 } else {
                     // Search for artist
                     let results = api.search_artist(&input).await?;
@@ -196,10 +212,10 @@ async fn interactive_mode(api: &DeezerApi, format: TrackFormat, output: &PathBuf
                         .interact()?;
 
                     let art_id = data[sel]["id"].as_u64().unwrap_or(0).to_string();
-                    download::download_artist(api, &art_id, format, output).await?;
+                    download::download_artist(api, &art_id, format, output, concurrency, false).await?;
                 }
             }
-            4 => {
+            5 => {
                 println!("Bye!");
                 break;
             }
@@ -213,6 +229,7 @@ async fn interactive_mode(api: &DeezerApi, format: TrackFormat, output: &PathBuf
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let format = parse_format(&cli.quality);
+    let concurrency = cli.threads;
     let is_interactive = matches!(cli.command, Some(Commands::Interactive) | None);
     let output = cli.output.clone().unwrap_or_else(|| {
         if is_interactive {
@@ -253,15 +270,19 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Playlist { url }) => {
             let id = extract_id(&url, "playlist");
-            download::download_playlist(&api, &id, format, &output).await?;
+            download::download_playlist(&api, &id, format, &output, concurrency).await?;
         }
-        Some(Commands::Favorites) => {
-            download::download_favorites(&api, format, &output).await?;
+        Some(Commands::Favorites { all_artists }) => {
+            if all_artists {
+                download::download_favorite_artists(&api, format, &output, concurrency, cli.include_all).await?;
+            } else {
+                download::download_favorites(&api, format, &output, concurrency).await?;
+            }
         }
         Some(Commands::Artist { query }) => {
             if query.contains("deezer.com") || query.chars().all(|c| c.is_ascii_digit()) {
                 let id = extract_id(&query, "artist");
-                download::download_artist(&api, &id, format, &output).await?;
+                download::download_artist(&api, &id, format, &output, concurrency, cli.include_all).await?;
             } else {
                 // Search
                 let results = api.search_artist(&query).await?;
@@ -288,11 +309,11 @@ async fn main() -> Result<()> {
                     .interact()?;
 
                 let art_id = data[sel]["id"].as_u64().unwrap_or(0).to_string();
-                download::download_artist(&api, &art_id, format, &output).await?;
+                download::download_artist(&api, &art_id, format, &output, concurrency, cli.include_all).await?;
             }
         }
         Some(Commands::Interactive) | None => {
-            interactive_mode(&api, format, &output).await?;
+            interactive_mode(&api, format, &output, concurrency).await?;
         }
         Some(Commands::Logout) => unreachable!(),
     }
