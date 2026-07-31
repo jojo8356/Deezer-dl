@@ -1,6 +1,7 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -19,6 +20,226 @@ fn sanitize_filename(name: &str) -> String {
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+fn value_as_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+fn normalized_artist_name(name: &str) -> String {
+    name.trim().to_lowercase()
+}
+
+fn track_belongs_to_artist(track: &GwTrack, artist_id: &str, artist_name: &str) -> bool {
+    let expected_name = normalized_artist_name(artist_name);
+
+    if track.art_id.as_ref().and_then(value_as_string).as_deref() == Some(artist_id) {
+        return true;
+    }
+
+    if normalized_artist_name(&track.artist()) == expected_name {
+        return true;
+    }
+
+    false
+}
+
+fn is_audio_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_lowercase().as_str(),
+                "flac" | "mp3" | "m4a" | "aac" | "ogg" | "opus" | "wav"
+            )
+        })
+        .unwrap_or(false)
+}
+
+async fn remove_empty_dirs(root: &Path) -> Result<()> {
+    let mut dirs = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let mut entries = fs::read_dir(&dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if entry.file_type().await?.is_dir() {
+                stack.push(path);
+            }
+        }
+        dirs.push(dir);
+    }
+
+    dirs.sort_by_key(|dir| std::cmp::Reverse(dir.components().count()));
+
+    for dir in dirs {
+        if dir == root {
+            continue;
+        }
+
+        if fs::read_dir(&dir).await?.next_entry().await?.is_none() {
+            fs::remove_dir(&dir).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn clean_artist_directory(artist_dir: &Path, artist_name: &str) -> Result<usize> {
+    if !artist_dir.exists() {
+        return Ok(0);
+    }
+
+    let expected_prefix = format!("{} - ", sanitize_filename(artist_name));
+    let mut removed = 0;
+    let mut stack = vec![artist_dir.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let mut entries = fs::read_dir(&dir).await?;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let file_type = entry.file_type().await?;
+
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+
+            if !file_type.is_file() || !is_audio_file(&path) {
+                continue;
+            }
+
+            let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+
+            if !filename.starts_with(&expected_prefix) {
+                fs::remove_file(&path).await?;
+                removed += 1;
+            }
+        }
+    }
+
+    remove_empty_dirs(artist_dir).await?;
+
+    Ok(removed)
+}
+
+async fn audio_file_hash(path: &Path) -> Result<String> {
+    let data = fs::read(path)
+        .await
+        .with_context(|| format!("Failed to read audio file for hashing: {}", path.display()))?;
+    Ok(crypto::md5_hex(&data))
+}
+
+async fn collect_audio_files(root: &Path) -> Result<Vec<PathBuf>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let mut entries = fs::read_dir(&dir).await?;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let file_type = entry.file_type().await?;
+
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file() && is_audio_file(&path) {
+                files.push(path);
+            }
+        }
+    }
+
+    Ok(files)
+}
+
+async fn build_audio_hash_index(root: &Path) -> Result<(HashMap<String, PathBuf>, usize)> {
+    let mut index = HashMap::new();
+    let mut linked = 0;
+
+    for file in collect_audio_files(root).await? {
+        if dedupe_audio_file(&file, &mut index).await? {
+            linked += 1;
+        }
+    }
+
+    Ok((index, linked))
+}
+
+async fn replace_with_hardlink(source: &Path, target: &Path) -> Result<()> {
+    let filename = target
+        .file_name()
+        .and_then(|filename| filename.to_str())
+        .unwrap_or("duplicate");
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp = parent.join(format!("{}.dedupe-tmp", filename));
+
+    for i in 1.. {
+        if !temp.exists() {
+            break;
+        }
+
+        temp = parent.join(format!("{}.dedupe-tmp-{}", filename, i));
+    }
+
+    fs::rename(target, &temp)
+        .await
+        .with_context(|| format!("Failed to prepare duplicate file: {}", target.display()))?;
+
+    match fs::hard_link(source, target).await {
+        Ok(()) => {
+            fs::remove_file(&temp).await.with_context(|| {
+                format!("Failed to remove duplicate temp file: {}", temp.display())
+            })?;
+            Ok(())
+        }
+        Err(err) => {
+            if let Err(restore_err) = fs::rename(&temp, target).await {
+                bail!(
+                    "Failed to create hardlink from {} to {}: {}; also failed to restore duplicate: {}",
+                    source.display(),
+                    target.display(),
+                    err,
+                    restore_err
+                );
+            }
+
+            Err(err).with_context(|| {
+                format!(
+                    "Failed to create hardlink from {} to {}",
+                    source.display(),
+                    target.display()
+                )
+            })
+        }
+    }
+}
+
+async fn dedupe_audio_file(path: &Path, hash_index: &mut HashMap<String, PathBuf>) -> Result<bool> {
+    let hash = audio_file_hash(path).await?;
+
+    if let Some(existing) = hash_index.get(&hash) {
+        if existing == path {
+            return Ok(false);
+        }
+
+        replace_with_hardlink(existing, path).await?;
+        return Ok(true);
+    }
+
+    hash_index.insert(hash, path.to_path_buf());
+    Ok(false)
 }
 
 /// Get a download URL for a track at the preferred format, with fallback
@@ -60,14 +281,16 @@ async fn get_download_url(
     let mut try_format = Some(current_format);
     while let Some(fmt) = try_format {
         if track.filesize_for_format(fmt) > 0 {
-            let url = crypto::generate_crypted_stream_url(&sng_id, &md5, &media_version, fmt.code());
+            let url =
+                crypto::generate_crypted_stream_url(&sng_id, &md5, &media_version, fmt.code());
             return Ok((url, fmt, true));
         }
         try_format = fmt.fallback();
     }
 
     // Last resort: try the preferred format anyway
-    let url = crypto::generate_crypted_stream_url(&sng_id, &md5, &media_version, current_format.code());
+    let url =
+        crypto::generate_crypted_stream_url(&sng_id, &md5, &media_version, current_format.code());
     is_crypted = true;
     Ok((url, current_format, is_crypted))
 }
@@ -195,9 +418,7 @@ pub async fn download_playlist(
 ) -> Result<()> {
     // Get playlist info
     let info = api.get_playlist_info(playlist_id).await?;
-    let playlist_name = info["DATA"]["TITLE"]
-        .as_str()
-        .unwrap_or("Unknown Playlist");
+    let playlist_name = info["DATA"]["TITLE"].as_str().unwrap_or("Unknown Playlist");
     let playlist_dir = output_dir.join(sanitize_filename(playlist_name));
 
     println!("Downloading playlist: {}\n", playlist_name);
@@ -294,9 +515,7 @@ pub async fn download_artist(
     output_dir: &Path,
 ) -> Result<()> {
     let artist_info = api.get_artist_info(art_id).await?;
-    let artist_name = artist_info["ART_NAME"]
-        .as_str()
-        .unwrap_or("Unknown Artist");
+    let artist_name = artist_info["ART_NAME"].as_str().unwrap_or("Unknown Artist");
 
     println!("Fetching discography for: {}\n", artist_name);
 
@@ -309,8 +528,24 @@ pub async fn download_artist(
     println!("Found {} albums/releases\n", albums.len());
 
     let artist_dir = output_dir.join(sanitize_filename(artist_name));
+    let removed = clean_artist_directory(&artist_dir, artist_name).await?;
+    if removed > 0 {
+        println!(
+            "Removed {} non-{} audio file(s) from the artist folder\n",
+            removed, artist_name
+        );
+    }
+
     let mut total_downloaded = 0;
     let mut total_failed = 0;
+    let mut total_skipped = 0;
+    let (mut audio_hash_index, mut total_linked) = build_audio_hash_index(&artist_dir).await?;
+    if total_linked > 0 {
+        println!(
+            "Linked {} duplicate audio file(s) already present in the artist folder\n",
+            total_linked
+        );
+    }
 
     for album in &albums {
         let alb_id = album.id_str();
@@ -332,8 +567,19 @@ pub async fn download_artist(
             let display = track.display_name();
             println!("  [{}/{}] {}", i + 1, tracks.len(), display);
 
+            if !track_belongs_to_artist(track, art_id, artist_name) {
+                total_skipped += 1;
+                println!("    [skip] Not by {}", artist_name);
+                continue;
+            }
+
             match download_track(api, track, format, &album_dir, true).await {
-                Ok(_) => {
+                Ok(path) => {
+                    if dedupe_audio_file(&path, &mut audio_hash_index).await? {
+                        total_linked += 1;
+                        println!("    [link] Duplicate audio linked to existing file");
+                    }
+
                     total_downloaded += 1;
                     println!("    [ok] Downloaded");
                 }
@@ -346,8 +592,8 @@ pub async fn download_artist(
     }
 
     println!(
-        "\nArtist download complete: {} downloaded, {} failed",
-        total_downloaded, total_failed
+        "\nArtist download complete: {} downloaded, {} linked duplicates, {} skipped, {} failed",
+        total_downloaded, total_linked, total_skipped, total_failed
     );
     Ok(())
 }
